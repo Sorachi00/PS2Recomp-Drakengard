@@ -99,6 +99,8 @@ struct GuestInvocation
     uint64_t tag = 0;
     R5900Context context{};
     std::function<void(const R5900Context &, R5900Context &)> onComplete;
+
+    bool started = false;
 };
 
 struct GuestThread
@@ -354,6 +356,7 @@ public:
 
     [[nodiscard]] EeKernelSnapshot snapshot() const;
     void publishSnapshot();
+
 
 private:
     struct ScheduledEvent

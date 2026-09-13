@@ -252,7 +252,18 @@ void EeScheduler::run()
             continue;
         }
 
-        if (!m_pendingInvocations.empty())
+        const bool hasActiveInterrupt = std::any_of(running->invocations.begin(), running->invocations.end(),
+            [](const GuestInvocation& invocation)
+            {
+                return invocation.kind == GuestInvocationKind::Interrupt;
+            });
+
+        const bool deferPendingInterrupt = !m_pendingInvocations.empty() && m_pendingInvocations.front().kind == GuestInvocationKind::Interrupt && hasActiveInterrupt;
+
+        if (!m_pendingInvocations.empty() &&
+            !deferPendingInterrupt &&
+            (running->invocations.empty() ||
+                running->invocations.back().started))
         {
             GuestInvocation invocation = std::move(m_pendingInvocations.front());
             m_pendingInvocations.pop_front();
@@ -293,6 +304,11 @@ void EeScheduler::run()
         try
         {
             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+            if (!running->invocations.empty())
+            {
+                running->invocations.back().started = true;
+            }
+
             m_guestExecuting.store(true, std::memory_order_release);
             function(m_rdram, &context, &m_runtime);
             m_guestExecuting.store(false, std::memory_order_release);
@@ -1278,7 +1294,7 @@ void EeScheduler::dispatchIrq(bool dmac, uint32_t cause)
         SET_GPR_U32(&invocation.context, 4, cause);
         SET_GPR_U32(&invocation.context, 5, handler.argument);
         SET_GPR_U32(&invocation.context, 28, handler.gp);
-        SET_GPR_U32(&invocation.context, 29, handler.sp);
+        SET_GPR_U32(&invocation.context, 29, 0u);
         SET_GPR_U32(&invocation.context, 31, 0u);
         queueInvocation(std::move(invocation));
     }
