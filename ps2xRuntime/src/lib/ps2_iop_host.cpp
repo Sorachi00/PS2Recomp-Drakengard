@@ -4,6 +4,7 @@
 #include "ps2_stubs.h"
 #include "Kernel/Stubs/SIF.h"
 #include "runtime/ps2_memory.h"
+#include "Kernel/Stubs/CD.h"
 #include "Kernel/Stubs/MemoryCard.h"
 #include "Kernel/Syscalls/Common.h"
 
@@ -506,3 +507,16 @@ void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)
     }
     std::cerr << prefix << ' ' << message << std::endl;
 }
+
+int32_t PS2IopHostAdapter::sceCdLayerSearchFile(
+    ps2x::iop::sceCdlFILE* file,
+    const char* path,
+    int32_t layer)
+{
+    return ps2_stubs::sceCdLayerSearchFile(
+        file,
+        path,
+        layer);
+}
+
+

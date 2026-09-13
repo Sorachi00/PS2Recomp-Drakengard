@@ -81,6 +81,8 @@ public:
 
     void log(ps2x::iop::LogLevel level, std::string_view message) override;
 
+    int32_t sceCdLayerSearchFile(ps2x::iop::sceCdlFILE* file, const char* path, int32_t layer) override;
+
 private:
     friend class CallScope;
 

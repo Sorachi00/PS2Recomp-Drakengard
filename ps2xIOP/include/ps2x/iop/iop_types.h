@@ -142,4 +142,12 @@ namespace ps2x::iop
         std::vector<DebugService> services;
         std::vector<std::string> diagnostics;
     };
+
+    struct sceCdlFILE
+    {
+        uint32_t lsn;
+        uint32_t size;
+        char name[16];
+        uint8_t date[8];
+    };
 }

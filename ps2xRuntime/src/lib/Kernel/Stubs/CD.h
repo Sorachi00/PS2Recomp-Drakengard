@@ -7,8 +7,14 @@
 #include <string>
 #include <vector>
 
+namespace ps2x::iop
+{
+    struct sceCdlFILE;
+}
+
 namespace ps2_stubs
 {
+    int32_t sceCdLayerSearchFile(ps2x::iop::sceCdlFILE* fp, const char* path, int32_t layer);
 
     struct CdDebugFileEntry
     {

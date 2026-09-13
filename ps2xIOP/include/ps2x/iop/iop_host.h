@@ -91,5 +91,8 @@ namespace ps2x::iop
                                          uint32_t *resultAddress) = 0;
 
         virtual void log(LogLevel level, std::string_view message) = 0;
+
+        virtual int32_t sceCdLayerSearchFile(sceCdlFILE* file, const char* path, int32_t layer) = 0;
     };
+
 }

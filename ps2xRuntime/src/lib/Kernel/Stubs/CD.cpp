@@ -2,6 +2,7 @@
 #include "CD.h"
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
+#include "ps2x/iop/iop_types.h"
 
 namespace ps2_stubs
 {
@@ -169,6 +170,42 @@ namespace ps2_stubs
         }
     }
 
+    int32_t sceCdLayerSearchFile(
+        ps2x::iop::sceCdlFILE* file,
+        const char* path,
+        int32_t layer)
+    {
+        (void)layer;
+
+        CdFileEntry entry;
+
+        if (!registerCdFile(path, entry))
+        {
+            return 0;
+        }
+
+        std::memset(file, 0, sizeof(*file));
+
+        file->lsn = entry.baseLbn;
+        file->size = entry.sizeBytes;
+
+        std::filesystem::path leafPath(normalizeCdPathNoPrefix(path));
+        std::string leaf = leafPath.filename().string();
+        leaf = stripIsoVersionSuffix(std::move(leaf));
+
+        std::strncpy(
+            file->name,
+            leaf.c_str(),
+            sizeof(file->name) - 1);
+
+        g_cdStreamingLbn = entry.baseLbn;
+        g_cdStreamingEndLbn =
+            entry.baseLbn + entry.sectors;
+
+        return 1;
+    }
+
+
     CdDebugSnapshot getCdDebugSnapshot()
     {
         CdDebugSnapshot snapshot{};
@@ -203,6 +240,7 @@ namespace ps2_stubs
                   { return a.baseLbn < b.baseLbn; });
         return snapshot;
     }
+
 
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
