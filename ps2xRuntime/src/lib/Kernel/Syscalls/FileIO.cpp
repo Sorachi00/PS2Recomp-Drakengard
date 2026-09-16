@@ -85,6 +85,15 @@ namespace ps2_syscalls
             setReturnS32(ctx, -1);
             return;
         }
+        const std::string pathStr(ps2Path);
+        const std::string lower = toLowerAscii(pathStr);
+
+        if (lower.rfind("rom0:", 0) == 0 || lower.rfind("rom:", 0) == 0)
+        {
+            //this should read romver, a file inside the bios with this 30 31 36 30 45 43 32 30 30 31 31 30 30 34 0A 00 with info about the console
+            setReturnS32(ctx, -1);
+            return;
+        }
 
         std::string hostPath = translatePs2Path(ps2Path);
         if (hostPath.empty())
