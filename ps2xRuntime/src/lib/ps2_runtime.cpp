@@ -1025,8 +1025,10 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
         paths.cdRoot = paths.elfDirectory;
         paths.mcRoot = paths.elfDirectory / "mc0";
     }
-
+    paths.cdImage = paths.elfDirectory / "disc" / "drakengard.iso";
     setIoPaths(paths);
+
+    const auto& configured = PS2Runtime::getIoPaths();
 }
 
 namespace
