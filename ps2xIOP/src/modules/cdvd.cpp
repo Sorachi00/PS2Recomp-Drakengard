@@ -3,6 +3,8 @@
 #include <array>
 #include <cstdint>
 #include <cstddef>
+#include <iostream>
+#include "../../../ps2xRuntime/include/ps2_runtime.h"
 
 //This is the template that other services uses like libsd
 namespace ps2x::iop::detail
@@ -85,15 +87,21 @@ namespace ps2x::iop::detail
                 //this is an adaptation of the sdk
 
                 (void)request.function; //(void)fno;
+
                 if(!m_host.readGuest(request.send.address, g_rpc_buffer4,request.send.size))
                     return{};
 
                 cdvdfsv_rpc4_inpacket_t* inbuf = reinterpret_cast<cdvdfsv_rpc4_inpacket_t*>(g_rpc_buffer4);
                 RpcResult result{};
+                const auto& paths = PS2Runtime::getIoPaths();
+
+                std::string fullSz12cPath = (paths.cdRoot).string() + "\\disc" + inbuf->m_pkt_sz12c.m_path;
+                fullSz12cPath.resize(fullSz12cPath.size() - 2); //remove the ;1 from the ISO 9660 standard
+
                 switch (request.send.size)
                 {
                     case sizeof(inbuf->m_pkt_sz12c) :
-                        g_cdvdfsv_srchres.m_retres = m_host.sceCdLayerSearchFile(&inbuf->m_pkt_sz12c.m_fp, inbuf->m_pkt_sz12c.m_path, inbuf->m_pkt_sz12c.m_layer);
+                        g_cdvdfsv_srchres.m_retres = m_host.sceCdLayerSearchFile(&inbuf->m_pkt_sz12c.m_fp, fullSz12cPath.c_str(), inbuf->m_pkt_sz12c.m_layer);
                         (void)m_host.writeGuest(inbuf->m_pkt_sz12c.m_eedest, g_rpc_buffer4, sizeof(sceCdlFILE) + 4);
                         break;
                     case sizeof(inbuf->m_pkt_sz128) :
@@ -105,7 +113,6 @@ namespace ps2x::iop::detail
                         g_cdvdfsv_srchres.m_retres = 0;
                         return result;
                 }
-
 
                 (void)m_host.writeGuest(
                     request.receive.address,
