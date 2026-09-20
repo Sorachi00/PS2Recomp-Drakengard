@@ -29,6 +29,7 @@ namespace ps2x::iop::detail
 
             void reset() override
             {
+                m_transferCode = 0u;
             }
 
             [[nodiscard]] RpcResult handleRpc(const RpcRequest& request) override
@@ -39,6 +40,9 @@ namespace ps2x::iop::detail
                 }
 
 
+                (void)m_host.readGuest(request.send.address + 4u, &m_transferCode, sizeof(m_transferCode));
+                (void)m_host.writeGuest(request.receive.address, &m_transferCode, sizeof(m_transferCode));
+   
                 RpcResult result;
                 result.handled = true;
                 result.resultAddress = request.receive.address;
@@ -49,6 +53,7 @@ namespace ps2x::iop::detail
             inline static constexpr std::array<uint32_t, 1> kSids{ kEzSoundSid };
 
             IopHost& m_host;
+            uint32_t m_transferCode = 0u;
         };
     }
 
