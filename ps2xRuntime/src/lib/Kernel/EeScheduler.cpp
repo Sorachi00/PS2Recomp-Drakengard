@@ -1752,6 +1752,13 @@ void EeScheduler::processPendingEvents()
 {
     assertExecutor();
     processDueDeadlines();
+    static uint64_t lastGifTick = 0u;
+    constexpr uint64_t kGifTickCycles = 294912u;
+    if (m_eeCycle - lastGifTick >= kGifTickCycles)
+    {
+        lastGifTick = m_eeCycle;
+        dispatchIrq(true, 2u);
+    }
     const uint32_t timerInterrupts = m_pendingEeTimerInterrupts;
     m_pendingEeTimerInterrupts = 0u;
     for (uint32_t timer = 0u; timer < 4u; ++timer)
