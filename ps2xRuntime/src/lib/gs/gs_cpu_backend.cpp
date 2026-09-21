@@ -436,6 +436,15 @@ namespace
         }
     }
 
+    void expandFrameModeLines(std::vector<uint8_t>& pixels, uint32_t width, uint32_t height)
+    {
+        if (pixels.empty() || width == 0u)
+            return;
+
+        for (uint32_t y = height; y-- > 1u;)
+            std::memcpy(pixels.data() + y * kHostFrameWidth * 4u, pixels.data() + (y / 2u) * kHostFrameWidth * 4u, width * 4u);
+    }
+
     void normalizePresentationAlpha(std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
     {
         for (uint32_t y = 0; y < height; ++y)
@@ -1872,6 +1881,8 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
             normalizePresentationAlpha(result.pixels, result.width, result.height);
             if (fieldMode)
                 applyFieldPresentation(result.pixels, result.width, result.height, oddField);
+            else if (smode2.interlaced && smode2.frameMode)
+                expandFrameModeLines(result.pixels, result.width, result.height);
             result.displayFbp = displayFrame1.fbp;
             result.sourceFbp = selected1.fbp;
             return result;
@@ -1887,6 +1898,8 @@ PresentationFrame GSCpuBackend::PresentFromLocalMemory(const GSPresentationReque
         return {};
     if (fieldMode)
         applyFieldPresentation(result.pixels, result.width, result.height, oddField);
+    else if (smode2.interlaced && smode2.frameMode)
+        expandFrameModeLines(result.pixels, result.width, result.height);
     normalizePresentationAlpha(result.pixels, result.width, result.height);
     result.displayFbp = displayFrame.fbp;
     result.sourceFbp = selected.fbp;
