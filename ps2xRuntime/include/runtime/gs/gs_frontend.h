@@ -2,6 +2,7 @@
 #define PS2_GS_FRONTEND_H
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -239,7 +240,7 @@ private:
     uint64_t m_debugNextSeq = 1;
     uint32_t m_debugFrameIndex = 0;
     uint64_t m_debugLastVsyncTick = UINT64_MAX;
-    bool m_debugHistoryPaused = true;
+    std::atomic<bool> m_debugHistoryPaused{true};
 
     std::unique_ptr<GSRasterBackend> m_backend;
 };

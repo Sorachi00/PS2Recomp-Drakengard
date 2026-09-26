@@ -13,6 +13,12 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#if defined(_MSC_VER) && defined(_WIN32)
+#include <execution>
+#endif
+#if defined(_M_X64) || defined(__x86_64__) || defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 using namespace GSInternal;
 
@@ -1051,10 +1057,34 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
     const float fy = sampleV - static_cast<float>(v0);
 
     const uint32_t c00 = samplePoint(u0, v0);
-    const uint32_t c10 = samplePoint(u1, v0);
-    const uint32_t c01 = samplePoint(u0, v1);
-    const uint32_t c11 = samplePoint(u1, v1);
+    // Zero-weight neighbours cannot affect the bilinear result.
+    if (fx == 0.0f && fy == 0.0f)
+        return c00;
 
+    const uint32_t c10 = (fx == 0.0f) ? c00 : samplePoint(u1, v0);
+    const uint32_t c01 = (fy == 0.0f) ? c00 : samplePoint(u0, v1);
+    const uint32_t c11 = (fx == 0.0f) ? c01 : (fy == 0.0f) ? c10 : samplePoint(u1, v1);
+
+#if defined(_M_X64) || defined(__x86_64__) || defined(__SSE2__)
+    // Interpolate RGBA together with the same operation order as lerpChannel.
+    const auto unpack = [](uint32_t color)
+    {
+        const __m128i bytes = _mm_cvtsi32_si128(static_cast<int>(color));
+        const __m128i words = _mm_unpacklo_epi8(bytes, _mm_setzero_si128());
+        return _mm_cvtepi32_ps(_mm_unpacklo_epi16(words, _mm_setzero_si128()));
+    };
+    const __m128 p00 = unpack(c00), p10 = unpack(c10), p01 = unpack(c01), p11 = unpack(c11);
+    const __m128 top = _mm_add_ps(p00, _mm_mul_ps(_mm_sub_ps(p10, p00), _mm_set1_ps(fx)));
+    const __m128 bottom = _mm_add_ps(p01, _mm_mul_ps(_mm_sub_ps(p11, p01), _mm_set1_ps(fx)));
+    const __m128 color = _mm_add_ps(top, _mm_mul_ps(_mm_sub_ps(bottom, top), _mm_set1_ps(fy)));
+    const __m128i integral = _mm_cvttps_epi32(color);
+    // Avoid float(color + .5), which can round values just below a half up.
+    const __m128 fraction = _mm_sub_ps(color, _mm_cvtepi32_ps(integral));
+    const __m128i increment = _mm_and_si128(_mm_castps_si128(_mm_cmpge_ps(fraction, _mm_set1_ps(.5f))), _mm_set1_epi32(1));
+    const __m128i rounded = _mm_add_epi32(integral, increment);
+    const __m128i words = _mm_packs_epi32(rounded, rounded);
+    return static_cast<uint32_t>(_mm_cvtsi128_si32(_mm_packus_epi16(words, words)));
+#else
     const uint8_t r = lerpChannel(static_cast<uint8_t>(c00 & 0xFFu),
                                   static_cast<uint8_t>(c10 & 0xFFu),
                                   static_cast<uint8_t>(c01 & 0xFFu),
@@ -1080,6 +1110,7 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
            (static_cast<uint32_t>(g) << 8) |
            (static_cast<uint32_t>(b) << 16) |
            (static_cast<uint32_t>(a) << 24);
+#endif
 }
 
 void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
@@ -1124,6 +1155,95 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
     const uint8_t alphaMode = static_cast<uint8_t>(alphaReg & 0xFFu);
     const uint8_t alphaFix = static_cast<uint8_t>((alphaReg >> 32) & 0xFFu);
 
+    // Decode the common RGBA32 sprite pipeline once, not once per pixel.
+    // Untextured sprites have a constant alpha-test result, including AFAIL.
+    const bool simpleWrite = ctx.frame.psm == GS_PSM_CT32 && ctx.frame.fbmsk == 0u &&
+        !state.prim.fge && (ctx.test & 0x4000u) == 0u &&
+        (!state.prim.tme || (ctx.test & 1u) == 0u) &&
+        (!state.prim.abe || alphaMode == 0x44u || alphaMode == 0x64u);
+    const PixelWriteMask spriteMask = state.prim.tme ? PixelWriteMask{} :
+        classifyAlphaTest(ctx.test, v1.a, ctx.frame.psm);
+    const unsigned depthMethod = (ctx.test >> 17) & 3u;
+    const uint32_t frameBase = framePageBaseToBlock(ctx.frame.fbp);
+    const uint32_t frameWidth = std::max<uint32_t>(ctx.frame.fbw, 1u);
+    const uint32_t depthBase = framePageBaseToBlock(ctx.zbuf.zbp);
+    // Parallel rows are only valid when swizzled writes are unique and no
+    // framebuffer, depth or texture alias can introduce cross-row feedback.
+    bool independentRows = simpleWrite && drawX1 < static_cast<int>(frameWidth * 64u) &&
+        (drawX1 - drawX0 + 1) * (drawY1 - drawY0 + 1) >= 16384;
+    const uint64_t frameBegin = uint64_t(ctx.frame.fbp) * 8192u;
+    const uint64_t spanBytes = (uint64_t(drawY1 / 32) * frameWidth + drawX1 / 64 + 1u) * 8192u;
+    const uint64_t frameEnd = frameBegin + spanBytes;
+    const uint64_t depthBegin = uint64_t(ctx.zbuf.zbp) * 8192u;
+    const uint64_t depthEnd = depthBegin + spanBytes;
+    const bool usesDepth = depthMethod >= 2u || (spriteMask.writeDepth && !ctx.zbuf.zmask);
+    independentRows &= frameEnd <= GSMem::MEMORY_SIZE;
+    if (usesDepth)
+        independentRows &= ctx.zbuf.psm == GS_PSM_Z32 && depthEnd <= GSMem::MEMORY_SIZE &&
+            (depthEnd <= frameBegin || frameEnd <= depthBegin);
+    if (state.prim.tme)
+    {
+        const auto& tex = ctx.tex0;
+        const uint64_t texBegin = uint64_t(tex.tbp0) * 256u;
+        const uint64_t texEnd = texBegin +
+            (uint64_t((state.textureHeight - 1u) / 32u) * tex.tbw + (state.textureWidth - 1u) / 64u + 1u) * 8192u;
+        independentRows &= tex.psm == GS_PSM_CT32 && (tex.tbp0 & 31u) == 0u &&
+            (ctx.clamp & 3u) <= 1u && ((ctx.clamp >> 2) & 3u) <= 1u && texEnd <= GSMem::MEMORY_SIZE &&
+            (texEnd <= frameBegin || frameEnd <= texBegin) &&
+            (!usesDepth || texEnd <= depthBegin || depthEnd <= texBegin);
+    }
+    const auto forRows = [&](const auto& drawRows)
+    {
+#if defined(_MSC_VER) && defined(_WIN32)
+        if (independentRows)
+        {
+            const std::array<int, 4> strips{0, 1, 2, 3};
+            const int rows = drawY1 - drawY0 + 1;
+            std::for_each(std::execution::par, strips.begin(), strips.end(), [&](int strip)
+            {
+                drawRows(drawY0 + rows * strip / 4, drawY0 + rows * (strip + 1) / 4);
+            });
+            return;
+        }
+#endif
+        drawRows(drawY0, drawY1 + 1);
+    };
+    const auto writeSpritePixel = [&](int x, int y, uint8_t r, uint8_t g, uint8_t b, uint8_t a)
+    {
+        if (!simpleWrite)
+        {
+            WritePixel(state, x, y, z1, r, g, b, a, v1.fog);
+            return;
+        }
+        if (!spriteMask.writesAnything() || depthMethod == 0u) return;
+        if (depthMethod >= 2u)
+        {
+            const uint32_t stored = ReadVramUnlocked(ctx.zbuf.psm, depthBase, frameWidth, x, y);
+            if (depthMethod == 2u ? z1 < stored : z1 <= stored) return;
+        }
+        if (spriteMask.writesFramebuffer())
+        {
+            const uint32_t offset = GSPSMCT32::addrPSMCT32(frameBase, frameWidth, x, y) & (GSMem::MEMORY_SIZE - 4u);
+            const bool blend = state.prim.abe && !(state.pabe && (a & 0x80u) == 0u);
+            uint32_t dst = 0;
+            if (blend || !spriteMask.writeAlpha) std::memcpy(&dst, m_vram + offset, sizeof(dst));
+            if (blend)
+            {
+                const int factor = alphaMode == 0x64u ? alphaFix : a;
+                const int dr = dst & 255u, dg = (dst >> 8) & 255u, db = (dst >> 16) & 255u;
+                r = clampU8((((int(r) - dr) * factor) >> 7) + dr);
+                g = clampU8((((int(g) - dg) * factor) >> 7) + dg);
+                b = clampU8((((int(b) - db) * factor) >> 7) + db);
+            }
+            if (spriteMask.writeAlpha && (ctx.fba & 1u) != 0u) a |= 0x80u;
+            if (!spriteMask.writeAlpha) a = static_cast<uint8_t>(dst >> 24);
+            const uint32_t pixel = pack32(r, g, b, a);
+            std::memcpy(m_vram + offset, &pixel, sizeof(pixel));
+        }
+        if (spriteMask.writeDepth && !ctx.zbuf.zmask)
+            WriteVramUnlocked(ctx.zbuf.psm, depthBase, frameWidth, x, y, z1);
+    };
+
     uint8_t r = v1.r, g = v1.g, b = v1.b, a = v1.a;
 
     if (state.prim.tme)
@@ -1157,44 +1277,50 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
         if (spriteH < 1.0f)
             spriteH = 1.0f;
 
-        for (int y = drawY0; y <= drawY1; ++y)
+        forRows([&](int firstRow, int endRow)
         {
-            float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
-            float texVf = v0f + (v1f - v0f) * ty;
-
-            for (int x = drawX0; x <= drawX1; ++x)
+            for (int y = firstRow; y < endRow; ++y)
             {
-                float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
-                float texUf = u0f + (u1f - u0f) * tx;
-                uint32_t texel = 0xFFFF00FFu;
-                if (state.prim.fst)
-                {
-                    const int fixedU = static_cast<int>((texUf * 16.0f) + 0.5f);
-                    const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
-                    const uint16_t sampleU = static_cast<uint16_t>(clampInt(fixedU, 0, 0xFFFF));
-                    const uint16_t sampleV = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
-                    texel = SampleTexture(state, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
-                }
-                else
-                {
-                    texel = SampleTexture(state, texUf / static_cast<float>(texW), texVf / static_cast<float>(texH), 1.0f, 0u, 0u);
-                }
+                float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
+                float texVf = v0f + (v1f - v0f) * ty;
 
-                uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
-                uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
-                uint8_t tb = static_cast<uint8_t>((texel >> 16) & 0xFF);
-                uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
+                for (int x = drawX0; x <= drawX1; ++x)
+                {
+                    float tx = (static_cast<float>(x - unclippedX0) + 0.5f) / spriteW;
+                    float texUf = u0f + (u1f - u0f) * tx;
+                    uint32_t texel = 0xFFFF00FFu;
+                    if (state.prim.fst)
+                    {
+                        const int fixedU = static_cast<int>((texUf * 16.0f) + 0.5f);
+                        const int fixedV = static_cast<int>((texVf * 16.0f) + 0.5f);
+                        const uint16_t sampleU = static_cast<uint16_t>(clampInt(fixedU, 0, 0xFFFF));
+                        const uint16_t sampleV = static_cast<uint16_t>(clampInt(fixedV, 0, 0xFFFF));
+                        texel = SampleTexture(state, 0.0f, 0.0f, 1.0f, sampleU, sampleV);
+                    }
+                    else
+                    {
+                        texel = SampleTexture(state, texUf / static_cast<float>(texW), texVf / static_cast<float>(texH), 1.0f, 0u, 0u);
+                    }
 
-                const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
-                WritePixel(state, x, y, z1, color.r, color.g, color.b, color.a, v1.fog);
+                    uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
+                    uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
+                    uint8_t tb = static_cast<uint8_t>((texel >> 16) & 0xFF);
+                    uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
+
+                    const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
+                    writeSpritePixel(x, y, color.r, color.g, color.b, color.a);
+                }
             }
-        }
+        });
     }
     else
     {
-        for (int y = drawY0; y <= drawY1; ++y)
-            for (int x = drawX0; x <= drawX1; ++x)
-                WritePixel(state, x, y, z1, r, g, b, a, v1.fog);
+        forRows([&](int firstRow, int endRow)
+        {
+            for (int y = firstRow; y < endRow; ++y)
+                for (int x = drawX0; x <= drawX1; ++x)
+                    writeSpritePixel(x, y, r, g, b, a);
+        });
     }
 }
 

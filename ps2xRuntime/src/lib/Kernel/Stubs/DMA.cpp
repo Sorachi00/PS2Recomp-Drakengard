@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "DMA.h"
+#include "runtime/gs/gs_perf.h"
 
 namespace ps2_stubs
 {
@@ -201,7 +202,10 @@ namespace ps2_stubs
 
     void sceDmaSend(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        setReturnS32(ctx, submitDmaSend(rdram, ctx, runtime, false));
+        const uint32_t returnPc = getRegU32(ctx, 31);
+        const int32_t result = submitDmaSend(rdram, ctx, runtime, false);
+        GSPerf::recordDrakengardFrameSubmission(returnPc, result);
+        setReturnS32(ctx, result);
     }
 
     void sceDmaSendI(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

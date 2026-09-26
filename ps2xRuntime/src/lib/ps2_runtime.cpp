@@ -5,6 +5,7 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_perf.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -19,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <chrono>
@@ -375,31 +377,15 @@ namespace
 
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
-    static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
-    static bool s_hasLatchedInitialFrame = false;
     static uint32_t s_lastDisplayFbp = std::numeric_limits<uint32_t>::max();
     static uint32_t s_lastSourceFbp = std::numeric_limits<uint32_t>::max();
     static bool s_lastPreferred = false;
     static uint32_t s_lastWidth = 0u;
     static uint32_t s_lastHeight = 0u;
-    static bool s_hasUploadedFrame = false;
     static std::vector<uint8_t> s_scratch;
     static std::vector<uint8_t> s_uploadBuffer(DEFAULT_FB_SIZE, 0u);
 
     const uint64_t currentTick = rt->eeScheduler().currentVSyncTick();
-    const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
-    if (needsLatch)
-    {
-        rt->gs().latchHostPresentationFrame();
-        s_lastPresentationTick = currentTick;
-        s_hasLatchedInitialFrame = true;
-    }
-    else if (s_hasUploadedFrame)
-    {
-        outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
-        outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
-        return;
-    }
 
     s_scratch.clear();
     uint32_t width = 0u;
@@ -421,7 +407,6 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         outHeight = DEFAULT_DISPLAY_HEIGHT;
         s_lastWidth = outWidth;
         s_lastHeight = outHeight;
-        s_hasUploadedFrame = true;
         return;
     }
 
@@ -474,7 +459,6 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     UpdateTexture(tex, s_uploadBuffer.data());
     outWidth = width;
     outHeight = height;
-    s_hasUploadedFrame = true;
 }
 
 PS2Runtime::PS2Runtime()
@@ -2304,6 +2288,7 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
 void PS2Runtime::run()
 {
     m_stopRequested.store(false, std::memory_order_relaxed);
+    GSPerf::gameFrames.store(0, std::memory_order_relaxed);
     ps2_stubs::resetSifState();
     resetIop();
     ps2_stubs::resetAudioStubState();
@@ -2347,7 +2332,33 @@ void PS2Runtime::run()
         }
         gameThreadFinished.store(true, std::memory_order_release); });
 
+    // One capture in flight; texture uploads stay on the window thread.
+    enum class CaptureState { Idle, Requested, Ready, Stopped };
+    std::atomic<CaptureState> captureState{CaptureState::Idle};
+    std::thread presentationThread([&]()
+    {
+        ThreadNaming::SetCurrentThreadName("PresentationThread");
+        for (;;)
+        {
+            captureState.wait(CaptureState::Idle, std::memory_order_acquire);
+            if (captureState.load(std::memory_order_acquire) == CaptureState::Stopped)
+                break;
+            gs().latchHostPresentationFrame();
+            auto expected = CaptureState::Requested;
+            // Do not overwrite a stop requested during the capture.
+            captureState.compare_exchange_strong(expected, CaptureState::Ready,
+                                                std::memory_order_release);
+            captureState.wait(CaptureState::Ready, std::memory_order_acquire);
+        }
+    });
+    uint64_t lastPresentationTick = std::numeric_limits<uint64_t>::max();
+    uint32_t presentWidth = FB_WIDTH;
+    uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
     uint64_t tick = 0;
+    auto perfStart = GSPerf::Clock::now();
+    uint64_t perfWindowFrames = 0;
+    uint64_t perfVsync = m_memory.gs().vsyncTick.load(std::memory_order_relaxed);
+    char perfText[128] = "...";
     while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
     {
         PS2_IF_AGRESSIVE_LOGS({
@@ -2381,9 +2392,20 @@ void PS2Runtime::run()
                                                << std::endl);
             }
         });
-        uint32_t presentWidth = FB_WIDTH;
-        uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        if (captureState.load(std::memory_order_acquire) == CaptureState::Ready)
+        {
+            UploadFrame(frameTex, this, presentWidth, presentHeight);
+            captureState.store(CaptureState::Idle, std::memory_order_release);
+            captureState.notify_one();
+        }
+        const uint64_t currentTick = m_eeScheduler->currentVSyncTick();
+        if (captureState.load(std::memory_order_acquire) == CaptureState::Idle &&
+            currentTick != lastPresentationTick)
+        {
+            lastPresentationTick = currentTick;
+            captureState.store(CaptureState::Requested, std::memory_order_release);
+            captureState.notify_one();
+        }
 
         BeginDrawing();
         ClearBackground(BLACK);
@@ -2405,7 +2427,29 @@ void PS2Runtime::run()
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);
         }
+        DrawRectangle(6, 6, 628, 24, Fade(BLACK, 0.8f));
+        DrawText(perfText, 10, 10, 16, WHITE);
         EndDrawing();
+        ++perfWindowFrames;
+
+        const auto sampleTime = GSPerf::Clock::now();
+        const auto elapsed = sampleTime - perfStart;
+        const double seconds = std::chrono::duration<double>(elapsed).count();
+        if (seconds >= 1.0)
+        {
+            const auto vsync = m_memory.gs().vsyncTick.load(std::memory_order_relaxed);
+            std::snprintf(perfText, sizeof(perfText),
+                "Game %.1f FPS | Window %.1f FPS | VSync %.1f/s",
+                GSPerf::framesPerSecond(GSPerf::gameFrames.exchange(0, std::memory_order_relaxed), elapsed),
+                GSPerf::framesPerSecond(perfWindowFrames, elapsed),
+                (vsync - perfVsync) / seconds);
+            std::cout << "[perf] " << perfText << std::endl;
+            // Include reporting time in the next interval rather than silently
+            // excluding it while the guest continues to produce frames.
+            perfStart = sampleTime;
+            perfWindowFrames = 0;
+            perfVsync = vsync;
+        }
 
         if (WindowShouldClose())
         {
@@ -2416,6 +2460,9 @@ void PS2Runtime::run()
     }
 
     requestStop();
+    captureState.store(CaptureState::Stopped, std::memory_order_release);
+    captureState.notify_one();
+    presentationThread.join();
     if (gameThread.joinable())
     {
         gameThread.join();

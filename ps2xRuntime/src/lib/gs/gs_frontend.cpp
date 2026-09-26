@@ -1,5 +1,9 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#ifdef _WIN32
+#include "runtime/gs/gs_gpu_backend.h"
+#endif
+#include <cstdlib>
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
@@ -12,6 +16,15 @@
 
 namespace
 {
+    std::unique_ptr<GSRasterBackend> makeDefaultBackend()
+    {
+#ifdef _WIN32
+        const char* backend = std::getenv("PS2_GS_BACKEND");
+        if (!backend || std::strcmp(backend, "cpu") != 0)
+            return std::make_unique<GSGpuBackend>();
+#endif
+        return std::make_unique<GSCpuBackend>();
+    }
     static constexpr uint32_t kHostFrameWidth = 640u;
 
     GSPrimReg decodePrimRegister(uint64_t value)
@@ -106,7 +119,7 @@ namespace
 
 
 GS::GS()
-    : m_backend(std::make_unique<GSCpuBackend>())
+    : m_backend(makeDefaultBackend())
 {
     reset();
 }
@@ -117,7 +130,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
     m_localMemorySize = vramSize;
     m_privRegs = privRegs;
     if (!m_backend)
-        m_backend = std::make_unique<GSCpuBackend>();
+        m_backend = makeDefaultBackend();
     m_backend->Initialize(vram, vramSize);
     reset();
 }
@@ -568,7 +581,7 @@ void GS::latchHostPresentationFrame()
         m_hasHostPresentationFrame = hasFrame;
     }
 
-    if (hasFrame)
+    if (hasFrame && !m_debugHistoryPaused.load(std::memory_order_relaxed))
     {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
         recordPresentDebugEventUnlocked(displayFbp, sourceFbp, width, height, usedPreferred);

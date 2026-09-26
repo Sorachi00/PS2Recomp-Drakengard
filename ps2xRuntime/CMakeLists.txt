@@ -505,6 +505,10 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+if(WIN32)
+    include(cmake/GpuShaders.cmake)
+    ps2x_add_gpu_backend(ps2_runtime)
+endif()
 target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime
